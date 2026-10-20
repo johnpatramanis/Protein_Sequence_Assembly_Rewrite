@@ -8,14 +8,16 @@
 ##
 ##################################################
 
-# Packages
+## Packages to load
 
 require(data.table)
 require(seqinr)
 require(bit64)
 
-# Load FASTA(s)
-# Transfor FASTA file into data table, well annotated
+## Load FASTA(s)
+## Transform FASTA file into data table, well annotated
+## Purpose: Reads one or more FASTA protein sequence files, extracts standard UniProt/FASTA header annotations (like Gene Name GN=, Organism OS=, and Organism ID OX=), and compiles everything into a clean, well-structured data.table.
+
 
 fasta_to_datatable <- function(path = ".", paths = as.character()) {
   if(length(paths > 0)){
@@ -46,7 +48,11 @@ fasta_to_datatable <- function(path = ".", paths = as.character()) {
   return(output)
 }
 
-# MQ proteinGroups Intensities to Int64
+
+
+### MQ proteinGroups Intensities to Int64
+## Purpose: Ensures that large quantitative columns from MaxQuant outputs (such as protein intensities, iBAQ, and LFQ values) are stored as 64-bit integers (integer64) to prevent overflow errors, and converts percentage columns to double precision.
+## input should be data.table of proteinGroups.txt
 
 MQintensity64 <- function(DT = x) {
   if(any(!sapply(DT[, grepl("(Intensity)|(iBAQ)|(LFQ)", 
@@ -73,7 +79,11 @@ MQintensity64 <- function(DT = x) {
   }
 }
 
-# Most common element in a Vector
+
+
+#### Most common element in a Vector
+### Purpose: Finds the most frequently occurring element in a character vector. If there is a tie, it picks the shortest string; if lengths are also equal, it selects the first one. It ignores empty strings ("").
+### Input: Vector of characters
 
 MostCommon <- function(x) {
   # Check if type character
@@ -100,7 +110,12 @@ MostCommon <- function(x) {
   return(x)
 }
 
-# All entries in a pasted list are e.g. contaminants
+
+#### All entries in a pasted list are e.g. contaminants
+#### Purpose: Checks multi-value delimited strings (e.g., protein IDs separated by semicolons) to see if all individual entries within a string match a specific search pattern. This is commonly used in proteomics to check if every protein in a group is a contaminant (CON__).
+
+### Input Format: 1) x: A character vector of concatenated strings (e.g., "CON__P12345;CON__P67890"). 2) pattern: A regular expression pattern to search for (default: "CON__"). 3) sep: The character separator used in the strings (default: ";").
+
 
 all.contain <- function(x, pattern = "CON__", sep = ";") {
   require(stringr)
@@ -114,9 +129,10 @@ all.contain <- function(x, pattern = "CON__", sep = ";") {
   return(x)
 }
 
-# Paste all list columns in a data table
 
-# Paste list-type columns
+#### Paste all list columns in a data table
+#### Identifies list-type columns inside a data.table and collapses their elements into standard character strings by pasting them together with a separator. This is helpful when data manipulation turns certain columns into list objects that need to be flattened for export.
+### Input dt: A data.table object containing one or more columns of type list. sep: A character string used to collapse the list items (default: ";").
 
 pasteListCols <- function(dt, sep = ";"){
   if(!is.data.table(dt)){
@@ -129,7 +145,9 @@ pasteListCols <- function(dt, sep = ";"){
 }
 
 
-# Melt Maxquant proteingroups table to long format
+#### Melt Maxquant proteingroups table to long format
+#### Reshapes a wide-format MaxQuant proteinGroups.txt table into a long-format table. It melts experimental columns (like Peptides, Intensity, LFQ, iBAQ, Sequence Coverage, and MS/MS counts) by experiment name, pairing them neatly with core protein metadata.
+#### Input: dt: A data.table representing a standard MaxQuant proteinGroups.txt file (typically read via data.table::fread) and an appendix: A string suffix appended to the newly melted value columns (default: "_long").
 
 MeltMQprot <- function(dt = x, appendix = "_long") {
   if(!is.data.table(dt)){

@@ -1,3 +1,13 @@
+##################################################
+# Project:
+# Author(s): Patrick Ruether
+# Date: 03.03.2020
+# Version:
+# Script purpose: Function collection
+##
+##
+##################################################
+
 ##########################
 #  Date: 190404
 #  User: PR
@@ -14,30 +24,38 @@ source("R-Project/Functions.R")
 
 ##LOAD TABLES
 
-# 1. Load Evidence
-evidence <- fread("txt\\evidence.txt")
+## 1. Load Evidence
+evidence <- fread("./Test_Data_Input/txt-ParanthropusSearch/evidence.txt")
 
-# 2. Load Summary
-Summary <- fread("txt\\summary.txt")
+## 2. Load Summary
+Summary <- fread("./Test_Data_Input/txt-ParanthropusSearch/summary.txt")
 Summary <- Summary[Experiment != ""]
 
-# 3. Load MSMS 
-MSMS <- fread("txt\\msms.txt")
+## 3. Load MSMS 
+MSMS <- fread("./Test_Data_Input/txt-ParanthropusSearch/msms.txt")
 
 
-##LOAD FASTA
+## LOAD FASTA
+#### Infor from Fasta labels are loaded as columns
+FASTA <- fasta_to_datatable(paths = "./Test_Data_Input/PR220121_GreatApes_Enamelome_aligned.fasta")
 
-FASTA <- fasta_to_datatable(paths = "PR220121_GreatApes_Enamelome_aligned.fasta")
-#Generate gapless sequences
+## Generate gapless sequences, add a new column, which is just the same sequence, but without gaps
 FASTA[, Gapless := str_remove_all(Sequence, "-")]
-# Add identifier (number 1 to N)
+
+## Add identifier (number 1 to N), add new column that is just and ID per sequence
 FASTA[,id := 1:.N]
-# generate site level fasta site by cutting the sequence after each a.a. and making it a new row in a new table
+
+## Create new table
+## Generate site level fasta site by cutting the sequence after each a.a. and making it a new row in a new table
 FASTAsites <- FASTA[, .(AA = unlist(str_split(Sequence, "")),
                         AlignedPos = 1:nchar(Sequence)),
                     by = .(Protein, Annot, Gene, Species, id)]
-#Add gapless position (add +1 for all "_")
+
+## Connect gapless and normal sequence position
+## Add gapless position (add +1 for all "_")
 FASTAsites[, GaplessPos := cumsum(AA != "-"), by = .(Annot)]
-#Add identifier for each amino acid: gene_aligned position
+
+## 
+## Add identifier for each amino acid: gene_aligned position
 FASTAsites[, GeneSite := paste(Gene, AlignedPos, sep = "_")]
 
