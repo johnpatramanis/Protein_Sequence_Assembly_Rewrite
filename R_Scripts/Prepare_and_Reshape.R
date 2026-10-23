@@ -8,8 +8,9 @@
 ### Load Libraries
 library(data.table)
 library(stringr)
-library(bit64)
+library(stringi)
 library(seqinr)
+library(bit64)
 
 
 ###### Paths and Environment setup
@@ -42,10 +43,11 @@ source("Functions.R")
 ### 0. Setting up paths and loading files from MaxQuant
 
 ## Set paths as variables so the script can be easily adapted to any MaxQuant run folder and FASTA file
-maxquant_dir <- "../Test_Data_Input/txt-ParanthropusSearch/"
+maxquant_dir <- "../Paranthropus_Yiannis_Reanalysis/txt"
 fasta_path <- "../Test_Data_Input/PR220121_GreatApes_Enamelome_aligned.fasta"
-exclusion_path <- "../Test_Data_Input/CK_ExclusionListSample.csv"
-output_dir <- "../Experiment_1_Output"
+exclusion_path <- "../Paranthropus_Yiannis_Reanalysis/IP_Exclusion_List.csv"
+samples_to_experiment_path <- "../Paranthropus_Yiannis_Reanalysis/Sample_to_Experiment.tsv"
+output_dir <- "../Paranthropus_Yiannis_Reanalysis"
 
 
 
@@ -92,6 +94,9 @@ FASTAsites[, GeneSite := paste(Gene, AlignedPos, sep = "_")]
 
 
 
+
+
+
 #################### Reshape and Output Files #############################
 
 
@@ -103,10 +108,28 @@ FASTAsites[, GeneSite := paste(Gene, AlignedPos, sep = "_")]
 ExpAnnot <- Summary[nzchar(`Enzyme mode`), .(Experiment, `Raw file`, Fraction)]
 setorder(ExpAnnot, `Raw file`)
 
-## Cleanup, create new column named "Sample"
-ExpAnnot[, Sample := Experiment]
 
-## Convert to Factor
+## load samples to experiments tab separated file, if it exists
+if (file.exists(samples_to_experiment_path)) {
+  samples_to_experiment <- fread(samples_to_experiment_path)
+  
+  # Ensure standard column names (1st col = Sample, 2nd col = Experiment)
+  setnames(samples_to_experiment, c("Sample", "Experiment"))
+  
+  # Merge mapping into ExpAnnot by Experiment
+  ExpAnnot <- merge(ExpAnnot, samples_to_experiment, by = "Experiment", all.x = TRUE)
+  
+  # Fallback for any experiments missing from the mapping file
+  ExpAnnot[is.na(Sample), Sample := Experiment]
+} else {
+  ## Fallback if no mapping file is provided
+  ExpAnnot[, Sample := Experiment]
+}
+## Cleanup, create new column named "Sample"
+
+
+
+## Convert Sample Column to Factor
 ExpAnnot[, Sample := as.factor(Sample)]
 
 ## Add info whether or not they are fractionated or single shot
@@ -296,11 +319,37 @@ MSMS[QE_hit == T, `Delta score` := mapply(function(scores, current_ds) {
 FDR <- 0.01
 MSMS[, Subset := Sample]
 setorder(MSMS, Subset, -Score)
+
+
+
+### Check if 'Reverse' or 'Decoy' column exist
+
+decoy_col <- if ("Reverse" %in% names(MSMS)) {
+  "Reverse"
+} else if ("Decoy" %in% names(MSMS)) {
+  "Decoy"
+} else {
+  stop("Neither 'Reverse' nor 'Decoy' column found in the MSMS table.")
+}
+
+
+### Prepare iterative Delta cutoff list
 DeltaOpt <- data.table(MinDelta = c(0:30, 10 * (4:10)))
+
+
+#### Go over each Delta cutoff
 DeltaOpt[, IDs := lapply(MinDelta, function(x) {
   tmp <- MSMS[`Delta score` >= x]
   setorder(tmp, Subset, -Score)
-  tmp[, qValue := cumsum(Reverse == "+")/1:.N, by = .(Subset)]
+  
+  # Calculate q-value using whichever decoy column is available
+  if (decoy_col == "Reverse") {
+    tmp[, qValue := cumsum(Reverse == "+")/1:.N, by = .(Subset)]
+  } else {
+    tmp[, qValue := cumsum(Decoy == "+")/1:.N, by = .(Subset)]
+  }
+  
+  #### Then 
   evidence[, .(EvidenceHits = .N,
                PSMs = sum(`MS/MS count`),
                Peptides = length(unique(Sequence)),
@@ -308,6 +357,8 @@ DeltaOpt[, IDs := lapply(MinDelta, function(x) {
            keyby = .(PassedMSMS_FDR = id %in% tmp[qValue <= FDR]$`Evidence ID`,
                      SampleGroup = as.character(Sample))][PassedMSMS_FDR == T]
 })]
+
+
 DeltaOpt[, Samples := lapply(IDs, function(x) x$SampleGroup)]
 DeltaOpt[, Peptides := lapply(IDs, function(x) x$Peptides)]
 DeltaOpt[, EvidenceHits := lapply(IDs, function(x) x$EvidenceHits)]
@@ -385,8 +436,13 @@ MSMS_F[, Optimal_Delta := NULL]
 setorder(MSMS_F, Subset, -Score)
 
 #### Calculate q-Value
+if (decoy_col == "Reverse") {
 MSMS_F <- MSMS_F[, qValue := cumsum(Reverse == "+")/1:.N, by = .(Subset)]
-
+} else{
+  
+MSMS_F <- MSMS_F[, qValue := cumsum(Decoy == "+")/1:.N, by = .(Subset)]
+  
+}
 #### Select the last PSM that's under the q-value threshold
 MSMS_F[, PassedFDR := 1:.N <= which.max(which(qValue <= FDR)), by = .(Subset)]
 MSMS_F[, .N, by = .(Subset, PassedFDR)]
@@ -404,7 +460,11 @@ MSMS_F <- MSMS_F[PassedFDR == T]
 evidenceF <- evidence[id %in% MSMS_F$`Evidence ID`]
 
 ##### FDR from the 1% applied on the MSMS table. Still need to remove the 1% reverse hits. Remove matches to Contaminants
+if (decoy_col == "Reverse") {
 evidenceF <- evidenceF[Reverse != "+"]
+} else{
+evidenceF <- evidenceF[Decoy != "+"]
+}
 evidenceF <- evidenceF[!all.contain(Proteins, pattern = "CON"),]
 
 #### Annotate evidence with pep locations and filter based on exclusion list
