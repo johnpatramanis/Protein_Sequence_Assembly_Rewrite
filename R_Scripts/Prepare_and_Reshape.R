@@ -43,11 +43,15 @@ source("Functions.R")
 ### 0. Setting up paths and loading files from MaxQuant
 
 ## Set paths as variables so the script can be easily adapted to any MaxQuant run folder and FASTA file
-maxquant_dir <- "../Paranthropus_Yiannis_Reanalysis/txt"
-fasta_path <- "../Test_Data_Input/PR220121_GreatApes_Enamelome_aligned.fasta"
-exclusion_path <- "../Paranthropus_Yiannis_Reanalysis/IP_Exclusion_List.csv"
-samples_to_experiment_path <- "../Paranthropus_Yiannis_Reanalysis/Sample_to_Experiment.tsv"
-output_dir <- "../Paranthropus_Yiannis_Reanalysis"
+## maxquant_dir <- "../Output_and_Input_Paranthropus_Yiannis_Reanalysis/txt"
+maxquant_dir <- "../Test_Data_Input/txt-ParanthropusSearch"
+samples_to_experiment_path <- "../Test_Data_Input/Sample_to_Experiment.tsv"
+
+
+fasta_path <- "../Output_and_Input_Paranthropus_Yiannis_Reanalysis/Hominins_Palaeoproteomic_Reference_Enamel_Filtered_Labels_Fixed.fa"
+exclusion_path <- "../Output_and_Input_Paranthropus_Yiannis_Reanalysis/IP_Exclusion_List.csv"
+
+output_dir <- "../Output_and_Input_Paranthropus_Yiannis_Reanalysis"
 
 
 
@@ -70,7 +74,7 @@ MSMS <- fread(file.path(maxquant_dir, "msms.txt"))
 
 ## 4) Load FASTA
 #### Information from Fasta labels are loaded as columns
-FASTA <- fasta_to_datatable(paths = fasta_path)
+FASTA <- fasta_to_datatable_UPDATED(paths = fasta_path)
 
 ## 5) Generate gapless sequences, add a new column, which is just the same sequence, but without gaps
 FASTA[, Gapless := str_remove_all(Sequence, "-")]
@@ -80,17 +84,39 @@ FASTA[,id := 1:.N]
 
 ## Create new table
 ## Generate site level fasta site by cutting the sequence after each a.a. and making it a new row in a new table
-FASTAsites <- FASTA[, .(AA = unlist(str_split(Sequence, "")),
-                        AlignedPos = 1:nchar(Sequence)),
-                    by = .(Protein, Annot, Gene, Species, id)]
+FASTAsites <- FASTA[, {
+  aa_vec <- unlist(str_split(Sequence, ""))
+  aligned_pos <- 1:length(aa_vec)
+  
+  # Calculate gapless positions directly: 
+  # Non-gap characters get a sequential index (1, 2, 3...), gaps get NA or a carried-forward index
+  ## Connect gapless and normal sequence position
+  ## Add gapless position (add +1 for all "_")
+  is_aa <- aa_vec != "-"
+  gapless_pos <- integer(length(aa_vec))
+  gapless_pos[is_aa] <- seq_len(sum(is_aa))
+  gapless_pos[!is_aa] <- NA_integer_ # or handle gaps as needed
+  
+  list(
+    AA = aa_vec,
+    AlignedPos = aligned_pos,
+    GaplessPos = gapless_pos
+  )
+}, by = .(Protein, Annot, Gene, Species, id)]
 
-## Connect gapless and normal sequence position
-## Add gapless position (add +1 for all "_")
-FASTAsites[, GaplessPos := cumsum(AA != "-"), by = .(Annot)]
+
 
 ## 
 ## Add identifier for each amino acid: gene_aligned position
 FASTAsites[, GeneSite := paste(Gene, AlignedPos, sep = "_")]
+
+
+
+
+
+
+
+
 
 
 
@@ -181,7 +207,7 @@ if(length(pepseq_files) > 0 && any(grepl("PepSeq", pepseq_files))) {
   ### Find all proteins in the fasta (gapless sequences) that contain this peptide -> add second column with all the proteins containing that sequence
   PepSeqs[, Proteins := lapply(Sequence, function(x) FASTA[stri_detect(Gapless,  regex = x), ]$Protein)]
   
-  ### Take only peptides found in the FASTA and Make 1 row for each PepSequence-Protein pair (= expand table to long format)
+  ### Take these  peptides found in the FASTA and make 1 row for each PepSequence-Protein pair (= expand table to long format)
   PepSeqs <- PepSeqs[, .(Protein = unlist(Proteins)), by = .(Sequence)]
   
   ### Locate the peptide sequence in the respective FASTA gapless sequence -> add start and end position of the peptide from the gapless sequence
@@ -259,7 +285,24 @@ if(length(pepseq_files) > 0 && any(grepl("PepSeq", pepseq_files))) {
 ##################################################################################
 ##### 4. Delta Score recalculation and cutoff optimization
 
-#### Recalculate delta scores
+recalculate_delta_scores <- FALSE
+
+
+### Check if 'Reverse' or 'Decoy' column exist
+decoy_col <- if ("Reverse" %in% names(MSMS)) {
+  "Reverse"
+} else if ("Decoy" %in% names(MSMS)) {
+  "Decoy"
+} else {
+  stop("Neither 'Reverse' nor 'Decoy' column found in the MSMS table.")
+}
+
+
+
+### Optional, only go if recalculate_delta_scores parameter TRUE
+if (recalculate_delta_scores == TRUE) {
+
+  #### Recalculate delta scores
 MSMS[, DeltaBackup := copy(`Delta score`)]
 
 ### Split top 3 sequences from 'all sequences' tab of MQ
@@ -311,7 +354,7 @@ MSMS[QE_hit == T, `Delta score` := mapply(function(scores, current_ds) {
 
 
 
-
+###### 
 ##### Delta Score optimization plots - Sample-wise FDR at different delta score cutoffs - peptides, evidence hits, PSMs
 
 
@@ -322,15 +365,6 @@ setorder(MSMS, Subset, -Score)
 
 
 
-### Check if 'Reverse' or 'Decoy' column exist
-
-decoy_col <- if ("Reverse" %in% names(MSMS)) {
-  "Reverse"
-} else if ("Decoy" %in% names(MSMS)) {
-  "Decoy"
-} else {
-  stop("Neither 'Reverse' nor 'Decoy' column found in the MSMS table.")
-}
 
 
 ### Prepare iterative Delta cutoff list
@@ -448,7 +482,9 @@ MSMS_F[, PassedFDR := 1:.N <= which.max(which(qValue <= FDR)), by = .(Subset)]
 MSMS_F[, .N, by = .(Subset, PassedFDR)]
 MSMS_F <- MSMS_F[PassedFDR == T]
 
-
+} else { ### Else Default MSMS
+  MSMS_F <- MSMS
+}
 
 
 

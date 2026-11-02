@@ -4,7 +4,7 @@
 # Date: 03.03.2020
 # Version:
 # Script purpose: Function collection
-## Modified by Ioannis Patramanis 2026
+##
 ##
 ##################################################
 
@@ -17,6 +17,7 @@ require(bit64)
 ## Load FASTA(s)
 ## Transform FASTA file into data table, well annotated
 ## Purpose: Reads one or more FASTA protein sequence files, extracts standard UniProt/FASTA header annotations (like Gene Name GN=, Organism OS=, and Organism ID OX=), and compiles everything into a clean, well-structured data.table.
+
 
 fasta_to_datatable <- function(path = ".", paths = as.character()) {
   if(length(paths > 0)){
@@ -40,22 +41,121 @@ fasta_to_datatable <- function(path = ".", paths = as.character()) {
       output <- iFASTA
     }
   }
-  
-  # Extract standard UniProt annotations
   output[, Gene := str_extract(Annot, "(?<=GN\\=)[^\\s]+")]
+  output[, Gene := toupper(Gene)]
   output[, Species := str_extract(Annot, "(?<=OS\\=)[^\\s]+\\s[^\\s]+")]
   output[, SpeciesID := str_extract(Annot, "(?<=OX\\=)[^\\s]+")]
-  
-  # Fallback for headers without standard UniProt annotations
-  missing_uniprot <- is.na(output$Gene) | output$Gene == ""
-  if(any(missing_uniprot)){
-    fallback_labels <- output$Annot[missing_uniprot]
-    output[missing_uniprot, Gene := sub("^.*_(.+)$", "\\1", fallback_labels)]
-    output[missing_uniprot, Species := sub("_(?!.*_).+$", "", fallback_labels, perl = TRUE)]
-    output[missing_uniprot, SpeciesID := sub("_(?!.*_).+$", "", fallback_labels, perl = TRUE)]
+  return(output)
+}
+
+
+fasta_to_datatable_UPDATED <- function(path = ".", paths = as.character()) {
+
+
+  if(length(paths > 0)){
+    FASTApaths <- paths
+  } else {
+    if(length(list.files(path, pattern = ".fasta", ignore.case = TRUE)) == 0) stop("No FASTA file in specified path")
+    FASTApaths <- list.files(path, pattern = ".fasta", full.names = TRUE, ignore.case = TRUE)
   }
   
+  output_list <- list()
+  for(i in FASTApaths){
+    iFASTA <- read.fasta(i, seqtype = "AA", as.string = TRUE, strip.desc = TRUE)
+    iFASTAmatrix <- matrix(unlist(lapply(iFASTA, attributes)), byrow = TRUE,
+                           ncol = length(names(attributes(iFASTA[[1]]))))
+    colnames(iFASTAmatrix) <- names(attributes(iFASTA[[1]]))
+    
+    dt_temp <- data.table(iFASTAmatrix, Sequence = unlist(iFASTA, use.names = FALSE))
+    dt_temp$File <- i
+    output_list[[i]] <- dt_temp
+  }
+  
+  output <- rbindlist(output_list, fill = TRUE)
+  
+  if (!"Annot" %in% names(output) && "name" %in% names(output)) {
+    output[, Annot := name]
+  }
+  
+  # Detect UniProt format (contains '|' or standard tags like OS= / OX=)
+  output[, is_uniprot := grepl("\\|", Annot) | (grepl("OS=", Annot) & grepl("OX=", Annot))]
+  
+  # Initialize columns if missing
+  cols_to_init <- c("Database", "Protein", "Gene_Species", "Gene", "Species", "SpeciesID")
+  for(c_name in cols_to_init) {
+    if(!c_name %in% names(output)) output[, (c_name) := NA_character_]
+  }
+  
+  # --- MODE 1: UniProt Format ---
+  uniprot_idx <- which(output$is_uniprot == TRUE)
+  if (length(uniprot_idx) > 0) {
+    u_parts <- str_split_fixed(output$Annot[uniprot_idx], "\\|", 3)
+    output[uniprot_idx, Database := u_parts[, 1]]
+    output[uniprot_idx, Protein := u_parts[, 2]]
+    output[uniprot_idx, Gene_Species := u_parts[, 3]]
+    
+    output[uniprot_idx, Gene := str_extract(Annot, "(?<=GN\\=)[^\\s]+")]
+    output[uniprot_idx, Species := str_extract(Annot, "(?<=OS\\=)[^\\s]+\\s[^\\s]+")]
+    output[uniprot_idx, SpeciesID := str_extract(Annot, "(?<=OX\\=)[^\\s]+")]
+    
+    missing_g <- is.na(output[uniprot_idx, Gene]) | output[uniprot_idx, Gene] == ""
+    if (any(missing_g)) {
+      sub_idx <- uniprot_idx[missing_g]
+      fallback_labels <- output[sub_idx, Annot]
+      output[sub_idx, Gene := sub("^.*_(.+)$", "\\1", fallback_labels)]
+    }
+  }
+  
+  # --- MODE 2: Non-UniProt Format ---
+  custom_idx <- which(output$is_uniprot == FALSE)
+  if (length(custom_idx) > 0) {
+    custom_labels <- output[custom_idx, Annot]
+    
+    # Split at the last underscore "_"
+    prefix_part <- sub("_(?!.*_).+$", "", custom_labels, perl = TRUE)
+    suffix_part <- sub("^.*_(.+)$", "\\1", custom_labels)
+    
+    output[custom_idx, name := prefix_part]
+    output[custom_idx, Annot := prefix_part]
+    output[custom_idx, Gene_Species := prefix_part]
+    output[custom_idx, SpeciesID := prefix_part]
+    output[custom_idx, Database := "Custom_Database"]
+    output[custom_idx, Gene := suffix_part]
+  }
+  
+  output[, is_uniprot := NULL]
   output[, Gene := toupper(Gene)]
+  
+  # --- Handle empty Protein column entries with unique gene-based suffixes ---
+  empty_prot <- which(is.na(output$Protein) | output$Protein == "")
+  if (length(empty_prot) > 0) {
+    for (idx in empty_prot) {
+      base_gene <- ifelse(is.na(output$Gene[idx]) | output$Gene[idx] == "", "PROTEIN", output$Gene[idx])
+      counter <- 1
+      candidate <- paste0(base_gene, "_", counter)
+      while (candidate %in% output$Protein) {
+        counter <- counter + 1
+        candidate <- paste0(base_gene, "_", counter)
+      }
+      output[idx, Protein := candidate]
+    }
+  }
+  
+  # Global uniqueness check for Protein column across all entries
+  dup_prot <- duplicated(output$Protein) | duplicated(output$Protein, fromLast = TRUE)
+  if (any(dup_prot)) {
+    for (idx in which(dup_prot)) {
+      base_prot <- output$Protein[idx]
+      counter <- 1
+      candidate <- paste0(base_prot, "_", counter)
+      while (candidate %in% output$Protein) {
+        counter <- counter + 1
+        candidate <- paste0(base_prot, "_", counter)
+      }
+      output[idx, Protein := candidate]
+    }
+  }
+  
   return(output)
 }
 
