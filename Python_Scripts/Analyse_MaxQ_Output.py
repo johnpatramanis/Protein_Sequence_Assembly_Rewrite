@@ -46,9 +46,10 @@ output_dir = "../Output_and_Input_Paranthropus_Yiannis_Reanalysis_Python"
 os.makedirs(output_dir, exist_ok = True)
 
 
-## ==========================================================
-## 0) LOAD TABLES
-## ==========================================================
+## ================
+## LOAD TABLES
+## ================
+
 
 ### a) Load MaxQuant Evidence File
 evidence = pd.read_csv(os.path.join(maxquant_dir, "evidence.txt"), sep = "\t", low_memory = False)
@@ -200,6 +201,11 @@ ExpAnnot["Experiment"] = ExpAnnot["Experiment"].astype("category")
 
 
 
+
+
+
+
+
 # ==========================================================
 # 2. Annotate tables, by merging them with Exp Annot
 # ==========================================================
@@ -216,8 +222,18 @@ evidence = pd.merge(evidence_subset, ExpAnnot, on="Raw file", how="inner")
 
 
 
+
+
+
+
+
+
+
+
+
+
 # ==========================================================
-# 3. Annotate tables, by merging them with Exp Annot
+## 3. Annotate tables, by merging them with Exp Annot
 # ==========================================================
 
 
@@ -236,7 +252,7 @@ else:
     unique_peptides = MSMS["Sequence"].dropna().unique()
     
     ###
-    pep_records = []
+    pep_records = [] ### list of dictionaries, one entry per AA, per sequence match, per peptide (so peptides with no matches don't get here)
     id_counter = 1
     
     ### For each peptide sequence,
@@ -244,7 +260,7 @@ else:
     for seq in unique_peptides:
         
         ### Get true or false, which sequences from FASTA contain this peptide 
-        mask = FASTA["Gapless"].str.contains(re.escape(seq), na=False) 
+        mask = FASTA["Gapless"].str.contains(re.escape(seq), na = False) 
         matched_rows = FASTA[mask] ### subset FASTA to those that contain it
         
         ########### loop through matched rows (if they exist)
@@ -255,7 +271,7 @@ else:
             
             ### Find all start positions of the peptide in the gapless sequence
             for match in re.finditer(re.escape(seq), gapless_seq):
-                start_pos = match.start() + 1  # 1-based index        ###############################################################################################################                         
+                start_pos = match.start() + 1  ### +1 to convert python counting to real, protein length counting                     
                 
                 #### Expand to site level: 1 row per amino acid for each peptide-protein match
                 for offset in range(len(seq)):
@@ -267,7 +283,7 @@ else:
                     })
                 id_counter += 1
 
-    PepSeqs_sites = pd.DataFrame(pep_records) ### Dataframe, one AA per row. AA are grouped together by ID, if they belong to the same peptide
+    PepSeqs_sites = pd.DataFrame(pep_records) ### Convert Dataframe, one AA per row. AA are grouped together by ID, if they belong to the same peptide
     
     if not PepSeqs_sites.empty: ## if there is any matches
         
@@ -283,12 +299,12 @@ else:
         )
         
         ### Go back to peptide level: collapse GaplessPos and AlignedPos into comma-separated strings
-        grouped1 = PepSeqs_merged.groupby(["Gene", "Protein", "Sequence", "id"]).agg(
+        grouped1 = PepSeqs_merged.groupby(["Gene", "Protein", "Sequence", "id"]).agg( #### For AA that share Gene, Protein, Sequence and ID (so result should be one entry = 1 peptide match on one protein)
             GaplessPos=('GaplessPos', lambda x: ','.join(map(str, x))),
             AlignedPos=('AlignedPos', lambda x: ','.join(map(str, x)))
         ).reset_index()
         
-        ### Filter down to unique peptide sequence, Gene, and AlignedPos
+        ### Filter down to unique peptide sequence, Gene, and AlignedPos, (so result should be one entry = 1 peptide and all of its matches together)
         grouped2 = grouped1.groupby(["Sequence", "Gene", "AlignedPos"]).agg(
             Proteins=('Protein', lambda x: ';'.join(sorted(x.unique()))),
             GaplessPositions=('GaplessPos', lambda x: ';'.join(x))
@@ -300,13 +316,13 @@ else:
         
         ### Reorder and get rid of unique alignment artifacts based on comma count in Proteins
         grouped2["prot_comma_count"] = grouped2["Proteins"].str.count(",")
-        grouped2 = grouped2.sort_values(by=["Sequence", "Gene", "prot_comma_count"])
+        grouped2 = grouped2.sort_values(by = ["Sequence", "Gene", "prot_comma_count"])
         
-        # Collapse by Gene and Sequence
+        ### Collapse by Gene and Sequence, (so result should be one entry = 1 peptide and all of its matches together)
         PepSeqs = grouped2.groupby(["Gene", "Sequence"]).agg(
-            Proteins=('Proteins', lambda x: ';'.join(x)),
-            AlignedPos=('AlignedPos', lambda x: x.iloc[0]),
-            GaplessPositions=('GaplessPositions', lambda x: x.iloc[0])
+            Proteins=('Proteins', lambda x: ';'.join(x)), ### Different proteins from the group that matched, merged with ;
+            AlignedPos=('AlignedPos', lambda x: x.iloc[0]), #### The first position (1 for the whole group) in the alignment that matched
+            GaplessPositions=('GaplessPositions', lambda x: x.iloc[0]) ### The first position for each gapless match (1 per protein in the protein group)
         ).reset_index()
         
         #### Calculate how often a peptide sequence is repeated in the table (Multiplicity)
@@ -358,4 +374,334 @@ else:
 
 # ==========================================================
 ## 4. Delta Score recalculation and cutoff optimization
+# ==========================================================
+
+
+########## Control whether or not Delta Score will be recalculated
+recalculate_delta_scores = True
+
+
+#### Check if 'Reverse' or 'Decoy' column exists in MSMS (older version of MaxQuant seem to have 'Reverse', newer have 'Decoy'
+if "Reverse" in MSMS.columns:
+    decoy_col = "Reverse"
+elif "Decoy" in MSMS.columns:
+    decoy_col = "Decoy"
+else:
+    raise ValueError("Neither 'Reverse' nor 'Decoy' column found in the MSMS table.")
+
+
+
+
+###### --- Optional: Recalculate delta scores if enabled ---
+############################################################
+if recalculate_delta_scores:
+    
+    
+    ### Bckup MSMS Deltascores, just in case it is needed
+    MSMS["DeltaBackup"] = MSMS["Delta score"].copy()
+
+
+    #### Split top sequences, modified sequences, and scores (handled as lists by splitting on ';')
+    MSMS["Sequences"] = MSMS["All sequences"].astype(str).str.split(";")
+    MSMS["ModSequences"] = MSMS["All modified sequences"].astype(str).str.split(";")
+    
+    def parse_scores(val): ### Quick function to check if "All scores" column (delta scores) can be parsed
+        try:
+            return [float(x) for x in str(val).split(";") if x.strip() != ""]
+        except Exception:
+            return []
+            
+    MSMS["AllScores"] = MSMS["All scores"].apply(parse_scores)
+
+    ##### 1) Identify rank 1 and 2 hits identical except 1 Leucine / Isoleucine change, add it as a new column in MSMS
+    ##### For now we cannot distinguish I and L, so if this is the only difference, then there is no difference at all
+    il_hits = []
+    for seqs in MSMS["Sequences"]:
+        if isinstance(seqs, list) and len(seqs) >= 3 and pd.notna(seqs[0]) and pd.notna(seqs[1]):
+            s1 = seqs[0].replace("I", "L")
+            s2 = seqs[1].replace("I", "L")
+            il_hits.append(s1 == s2)
+        else:
+            il_hits.append(False)
+    MSMS["IL_hit"] = il_hits
+
+    ##### Update delta score for IL hits, use the score difference between 2nd and 3rd hit instead of 1st and 2nd
+    new_delta = MSMS["Delta score"].copy()
+    for idx in MSMS.index[MSMS["IL_hit"]]:
+        scores = MSMS.loc[idx, "AllScores"]
+        if isinstance(scores, list) and len(scores) >= 3 and pd.notna(scores[1]) and pd.notna(scores[2]):
+            new_delta.loc[idx] = scores[1] - scores[2]
+    MSMS["Delta score"] = new_delta
+
+
+
+
+    #### 2) Identify rank 1 and 2 hits identical except Q/E or N/D changes
+    ##### Deamidation are so common, so Q to E or N to D changes, should not count for difference between hits
+    qe_hits = []
+    for mod_seqs in MSMS["ModSequences"]:
+        if isinstance(mod_seqs, list) and len(mod_seqs) >= 3 and pd.notna(mod_seqs[0]) and pd.notna(mod_seqs[1]):
+            s1 = re.sub(r"Q\(de\)", "E", re.sub(r"N\(de\)", "D", mod_seqs[0]))
+            s2 = re.sub(r"Q\(de\)", "E", re.sub(r"N\(de\)", "D", mod_seqs[1]))
+            qe_hits.append(s1 == s2)
+        else:
+            qe_hits.append(False)
+    MSMS["QE_hit"] = qe_hits
+    
+    ##### Again, update delta score for Q-E/N-D hits, use the score difference between 2nd and 3rd hit instead of 1st and 2nd
+    new_delta = MSMS["Delta score"].copy()
+    for idx in MSMS.index[MSMS["QE_hit"]]:
+        scores = MSMS.loc[idx, "AllScores"]
+        if isinstance(scores, list) and len(scores) >= 3 and pd.notna(scores[1]) and pd.notna(scores[2]):
+            new_delta.loc[idx] = scores[1] - scores[2]
+    MSMS["Delta score"] = new_delta
+
+
+
+
+
+
+###===========================================================
+### Delta Score Optimization Plots & FDR Cutoffs
+
+## Standard FDR is 0.01, unless we want to change it
+FDR = 0.01
+
+#### Sort MSMS by Sample (== Subset)
+MSMS["Subset"] = MSMS["Sample"]
+MSMS = MSMS.sort_values(by = ["Subset", "Score"], ascending = [True, False]).reset_index(drop = True)
+
+
+
+###### --- Optional: Recalculate delta scores if enabled ---
+############################################################
+
+if recalculate_delta_scores:
+    
+    #### Prepare iterative Delta cutoff list by 1 (0 to 30), then every 10 (40, 50, ..., 100)
+    min_deltas = list(range(31)) + [i * 10 for i in range(4, 11)]
+    delta_opt_records = []
+
+
+    ### Cycle through cutoffs
+    for min_d in min_deltas:
+        tmp = MSMS[MSMS["Delta score"] >= min_d].copy() ### get peptides that are above this delta score
+        tmp = tmp.sort_values(by=["Subset", "Score"], ascending=[True, False]).reset_index(drop = True) ### Sort them by sample and score (important, as we are going from best score to worse)
+        
+        ###### Calculate q-value per subset (sample), using the name of the decoy column.
+        ###### The function goes from top to bottom of the table (which is sorted by Score)
+        ###### At every entry, it counts how many false negatives (decoys/reverse) have been found by that point (negatives with higher score) and divides it by the number of total hits by that point (hits with higher score)
+        ###### That number is the new Qvalue to be compared with the FDR
+        tmp["qValue"] = tmp.groupby("Subset", group_keys = False, observed=False).apply(lambda group: (group[decoy_col] == "+").cumsum() / np.arange(1, len(group) + 1),include_groups = False)
+  
+        
+        #### Select all that have qvalue <= FDR
+        passed_ids = set(tmp.loc[tmp["qValue"] <= FDR, "Evidence ID"])
+        evidence["PassedMSMS_FDR"] = evidence["id"].isin(passed_ids)
+        evidence["SampleGroup"] = evidence["Sample"].astype(str)
+        
+        ##### Aggregate metrics for passed items
+        passed_ev = evidence[evidence["PassedMSMS_FDR"] == True]
+        if not passed_ev.empty:
+            agg_df = passed_ev.groupby("SampleGroup").agg(
+                EvidenceHits=("id", "count"),
+                PSMs=("MS/MS count", "sum"),
+                Peptides=("Sequence", "nunique")
+            ).reset_index()
+            agg_df["MinDelta"] = min_d
+            delta_opt_records.append(agg_df)
+
+    #### if not empty, prepare plot data
+    if delta_opt_records:
+        DeltaOptPlotting = pd.concat(delta_opt_records, ignore_index=True)
+        
+        # Melt dataframe for plotting
+        plot_data = DeltaOptPlotting.melt(
+            id_vars=["MinDelta", "SampleGroup"],
+            value_vars=["Peptides", "EvidenceHits", "PSMs"],
+            var_name="Identification",
+            value_name=F"IDs-at-{FDR}-FDR"
+        ).rename(columns={"SampleGroup": "Sample"})
+        
+        # Find optimal points (max IDs at 1% FDR for each Identification and Sample)
+        optimal_points = plot_data.loc[
+            plot_data.groupby(["Identification", "Sample"])[F"IDs-at-{FDR}-FDR"].idxmax()
+        ].copy()
+
+        # Calculate median optimal MinDelta across metrics for each sample
+        Optimal_Delta_scores = optimal_points.groupby("Sample")["MinDelta"].median().reset_index(name="Optimal_Delta")
+    else:
+        Optimal_Delta_scores = pd.DataFrame(columns=["Sample", "Optimal_Delta"])
+else:
+    Optimal_Delta_scores = pd.DataFrame(columns=["Sample", "Optimal_Delta"])
+
+
+
+
+### ==========-=----=-=-=-=-=-=-=============================
+### Optional Plotting of FDR Cutoff effects
+
+## Trigger to control plotting
+Plotting_is_a_go = True
+
+if recalculate_delta_scores and not plot_data.empty and Plotting_is_a_go:
+    
+    ### make sure these are installed before running
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    
+    identifications = plot_data["Identification"].unique()
+    samples = plot_data["Sample"].unique()
+    
+    num_rows = len(identifications)
+    num_cols = len(samples)
+    
+    # Dynamically calculate width based on number of samples
+    dynamic_width = max(10, num_cols * 2.5)
+    
+    fig, axes = plt.subplots(
+        num_rows, num_cols, 
+        figsize=(dynamic_width, num_rows * 3), 
+        sharey="row", 
+        sharex=True
+    )
+    
+    # Ensure axes is always a 2D array even if rows/cols == 1
+    if num_rows == 1 and num_cols == 1:
+        axes = np.array([[axes]])
+    elif num_rows == 1:
+        axes = axes[np.newaxis, :]
+    elif num_cols == 1:
+        axes = axes[:, np.newaxis]
+
+    # Color palette matching identifications
+    palette = sns.color_palette("tab10", num_rows)
+    color_dict = {ident: palette[i] for i, ident in enumerate(identifications)}
+
+    for r_idx, ident in enumerate(identifications):
+        for c_idx, sample in enumerate(samples):
+            ax = axes[r_idx, c_idx]
+            subset = plot_data[(plot_data["Identification"] == ident) & (plot_data["Sample"] == sample)]
+            
+            if not subset.empty:
+                col_color = color_dict[ident]
+                # Plot line
+                ax.plot(subset["MinDelta"], subset[F"IDs-at-{FDR}-FDR"], color=col_color, linewidth=1.2)
+                
+                # Find optimal point for this facet
+                opt_row = optimal_points[(optimal_points["Identification"] == ident) & (optimal_points["Sample"] == sample)]
+                if not opt_row.empty:
+                    opt_delta = opt_row["MinDelta"].values[0]
+                    # Vertical dashed line at optimal MinDelta
+                    ax.axvline(x=opt_delta, color=col_color, linestyle="--", alpha=0.6)
+                    # Text annotation at the bottom
+                    ax.text(opt_delta, 0, str(int(opt_delta)), rotation=90, va="bottom", ha="right", fontsize=9)
+            
+            # Label columns on top row, rows on left column
+            if r_idx == 0:
+                ax.set_title(str(sample), fontsize=10, fontweight="bold")
+            if c_idx == 0:
+                ax.set_ylabel(str(ident), fontsize=10, fontweight="bold")
+            if r_idx == num_rows - 1:
+                ax.set_xlabel("MinDelta", fontsize=9)
+            
+            ax.tick_params(axis="x", rotation=45, labelsize=8)
+            ax.grid(True, linestyle=":", alpha=0.5)
+
+    plt.tight_layout()
+    
+    # Save plot as PDF (equivalent to ggsave)
+    os.makedirs(output_dir, exist_ok=True)
+    plt.savefig(os.path.join(output_dir, "DeltaScore-Opt.pdf"), bbox_inches="tight", dpi=300)
+    plt.close()
+
+
+###==========================================================
+### Apply PSM FDR Control
+
+###### --- Optional: Recalculate delta scores if enabled ---
+############################################################
+if recalculate_delta_scores and not Optimal_Delta_scores.empty:
+    MSMS_F = MSMS.copy()
+    MSMS_F["Subset"] = MSMS_F["Sample"]
+    
+    # Merge optimal delta scores
+    MSMS_F = pd.merge(MSMS_F, Optimal_Delta_scores, on="Sample", how="left")
+    MSMS_F["Optimal_Delta"] = MSMS_F["Optimal_Delta"].fillna(15)
+    
+    # Filter by threshold
+    MSMS_F = MSMS_F[MSMS_F["Delta score"] >= MSMS_F["Optimal_Delta"]]
+    MSMS_F = MSMS_F.drop(columns=["Optimal_Delta"])
+else:
+    MSMS_F = MSMS.copy()
+
+
+
+
+#### Sort and compute final q-value
+MSMS_F = MSMS_F.sort_values(by=["Subset", "Score"], ascending=[True, False]).reset_index(drop=True)
+MSMS_F["qValue"] = MSMS_F.groupby("Subset", group_keys = False, observed = False).apply(lambda group: (group[decoy_col] == "+").cumsum() / np.arange(1, len(group) + 1), include_groups = False) #### See previous identical function for explanation a bit above
+
+
+#### Mini Function Select PSMs under q-value threshold
+def filter_passed_fdr(group, FDR = 0.01):
+    valid_idx = group["qValue"] <= FDR
+    if not valid_idx.any():
+        return pd.Series([False] * len(group), index=group.index)
+    last_valid = np.where(valid_idx)[0][-1]
+    
+    return pd.Series(np.arange(len(group)) <= last_valid, index=group.index)
+
+
+
+MSMS_F["PassedFDR"] = MSMS_F.groupby("Subset", group_keys = False, observed = False).apply(filter_passed_fdr, FDR = 0.01, include_groups = False)
+MSMS_F = MSMS_F[MSMS_F["PassedFDR"] == True].copy()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ==========================================================
+### 5. Transfer the filtered sequences from the MSMS table to the evidence table and
+### collapse to site level to combine information from overlapping peptides on 1 site
+# ==========================================================
+
+
+
+
+
+
+
+
+
+
+
+
+# ==========================================================
+## 6. Generate the consensus sequence
+# ==========================================================
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ==========================================================
+## 7. Generate output Files
 # ==========================================================
