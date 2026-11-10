@@ -12,7 +12,10 @@ from Bio import SeqIO
 # Original Author: Patrick Ruether (updated by Claire Koenig)
 # Converted to Python 3 by Ioannis Patramanis
 # Code Updates by Ioannis Patramanis in the year of our lord 2026
-# Script purpose: Environment setup, data loading, and FASTA processing
+# Script purpose: Takes as input the "txt" output folder of MaxQuant.
+# The script then organises experiments to samples (using provided file) re-calculates FDR scoring, filters low scores
+# generates a number of helpful metrics, inlcuding coverage per AA and variable sites (conflicting pepetides)
+#  and finally puts together all peptides of the same protein into a consensus sequence
 # ==========================================================
 
 
@@ -24,16 +27,26 @@ from Functions import (fasta_to_datatable, mq_intensity_64, most_common, all_con
 ## 0. Setting up paths and loading files from MaxQuant
 ## ==========================================================
 
-maxquant_dir = "../Test_Input_Data/txt-ParanthropusSearch"
+
+
+maxquant_dir = "../../Gigantopithecus_DentalEnamel/combined/txt"
 samples_to_experiment_path = "../Test_Input_Data/Sample_to_Experiment.tsv"
 
 fasta_path = "../Test_Input_Data/PR220121_GreatApes_Enamelome_aligned.fasta"
 exclusion_path = "../Test_Input_Data/CK_ExclusionListSample.csv"
 
-output_dir = "../Output_and_Input_Paranthropus_Yiannis_Reanalysis_Python"
+output_dir = "../Gigantopithecus_DentalEnamel"
 
 # Create output directory if it does not exist (equivalent to dir.create with recursive=TRUE)
 os.makedirs(output_dir, exist_ok = True)
+
+print(F"\nSetting up paths:\nMaxQuant directory:{maxquant_dir}\nFasta File(s):{fasta_path}\nOutput Directory:{output_dir}")
+
+if  samples_to_experiment_path:
+    print(F"Samples-to-Experiment list:{samples_to_experiment_path}")
+
+if  exclusion_path:
+    print(F"Peptide exclusion list:{exclusion_path}\n")
 
 
 ## ================
@@ -41,24 +54,34 @@ os.makedirs(output_dir, exist_ok = True)
 ## ================
 
 
-### a) Load MaxQuant Evidence File
+### Load MaxQuant Evidence File
 evidence = pd.read_csv(os.path.join(maxquant_dir, "evidence.txt"), sep = "\t", low_memory = False)
 
-### b) Load MaxQuant Summary File and filter out rows where Experiment is empty
+### Load MaxQuant Summary File and filter out rows where Experiment is empty
 summary = pd.read_csv(os.path.join(maxquant_dir, "summary.txt"), sep = "\t", low_memory = False)
 summary = summary[summary["Experiment"].notna() & (summary["Experiment"] != "")]
+summary["Experiment"] = summary["Experiment"].astype(str)
 
-### c) Load MaxQuant MSMS File
+
+### Load MaxQuant MSMS File
 MSMS = pd.read_csv(os.path.join(maxquant_dir, "msms.txt"), sep = "\t", low_memory = False)
 
 
 
-
-### d) Load FASTA & Generate Site-Level Table
-
 ### Load FASTA using our previously defined custom function 
 ### (note: pass as single file or a folder with fasta)
 FASTA = fasta_to_datatable(fasta_path)
+
+
+
+
+
+
+## ================
+## GENERATE REFERENCE FASTA TABLE
+## ================
+
+print('Generating FASTA reference Sequences\n')
 
 ### Generate gapless sequences (remove all hyphens '-' and 'X')
 FASTA["Gapless"] = FASTA["Sequence"].str.replace("-", "", regex = False)
@@ -68,7 +91,7 @@ FASTA["Gapless"] = FASTA["Gapless"].str.replace("X", "", regex = False)
 FASTA["id"] = range(1, len(FASTA) + 1)
 
 
-### f) Generate Site-Level FASTA Table
+### Generate Site-Level FASTA Table
 ### Splits each protein sequence character-by-character into individual amino acid rows.
 
 sites_records = []
@@ -102,6 +125,7 @@ for INDX, row in FASTA.iterrows(): ## Row is the whole row as dataframe
             "GaplessPos": gpos
         })
 
+
 #### Create the expanded site-level DataFrame
 FASTAsites = pd.DataFrame(sites_records)
 
@@ -117,13 +141,26 @@ FASTAsites["GeneSite"] = FASTAsites["Gene"].astype(str) + "_" + FASTAsites["Alig
 
 
 
-# ==========================================================
-# 1. Experimental annotation from summary table
-# ==========================================================
+#~~ ========================================================== ~~#
+##~ 1. Experimental annotation from summary table              ~##
+#~~ ========================================================== ~~#
+
+print('Annotating Summary.txt\n')
 
 ### Create new DataFrame from Summary where 'Enzyme mode' is non-empty
 ### Equivalent to: Summary[nzchar(`Enzyme mode`), .(Experiment, `Raw file`, Fraction)]
 enzyme_mode_valid = summary["Enzyme mode"].notna() & (summary["Enzyme mode"].astype(str).str.strip() != "") ### List of rows that have 'enzyme mode'
+
+if "Experiment" not in summary.columns:
+    summary["Experiment"] = list(range(1, len(summary) + 1))
+
+if "Raw file" not in summary.columns:
+    summary["Raw file"] = list(range(1, len(summary) + 1))
+
+if "Fraction" not in summary.columns:
+    summary["Fraction"] = 1
+
+
 ExpAnnot = summary.loc[enzyme_mode_valid, ["Experiment", "Raw file", "Fraction"]].copy() ### Get experiment, raw file and fraction for rows that have enzyme mode
 
 ### Sort by 'Raw file'
@@ -149,7 +186,7 @@ if os.path.exists(samples_to_experiment_path):
     )
     
     #### Fallback for any experiments missing from the mapping file (fill NA spots for 'sample' with Experiment name)
-    ExpAnnot["Sample"] = ExpAnnot["Sample"].fillna(ExpAnnot["Experiment"])
+    ExpAnnot["Sample"] = ExpAnnot["Experiment"]
 else:
     #### Fallback if no mapping file is provided
     ExpAnnot["Sample"] = ExpAnnot["Experiment"]
@@ -235,8 +272,11 @@ pepseq_files = [f for f in os.listdir(output_dir) if "PepSeq" in f] if os.path.e
 if len(pepseq_files) > 0:
     target_file = "PepSeqs.csv" if "PepSeqs.csv" in pepseq_files else pepseq_files[0]
     PepSeqs = pd.read_csv(os.path.join(output_dir, target_file))
+    print("Found previous PepSeqs.csv file\n")
 ### Else, we need to create it
 else:
+    
+    print("Generating PepSeqs.csv file\n")
     
     ### Get all unique peptide sequences from MSMS table
     unique_peptides = MSMS["Sequence"].dropna().unique()
@@ -386,6 +426,7 @@ else:
 ############################################################
 if recalculate_delta_scores:
     
+    print("Delta score recalibration enabled, recalculating delta scrores\n")
     
     ### Bckup MSMS Deltascores, just in case it is needed
     MSMS["DeltaBackup"] = MSMS["Delta score"].copy()
@@ -536,6 +577,8 @@ Plotting_is_a_go = True
 
 if recalculate_delta_scores and not plot_data.empty and Plotting_is_a_go:
     
+    print("Delta score cutoff plotting enabled, plotting delta possible scores\n")
+    
     ### make sure these are installed before running
     import matplotlib.pyplot as plt
     import seaborn as sns
@@ -672,7 +715,7 @@ MSMS_F = MSMS_F[MSMS_F["PassedFDR"] == True].copy()
 # ==========================================================
 
 
-
+print("Generating EvidenceFiltered.csv\n")
 
 
 ### Filter the evidence table based on re-calculated delta scores and FDR passing evidence IDs
@@ -748,7 +791,7 @@ IDbySample = evidenceF.groupby("Sample", observed = False).agg(
 IDbyExperiment.to_csv(os.path.join(output_dir, "IDbyExp.csv"), index = False)
 IDbySample.to_csv(os.path.join(output_dir, "IDbySample.csv"), index = False)
 
-
+print("Generating IDbyExp.csv and IDbySample.csv\n")
 
 
 
@@ -898,7 +941,8 @@ if not sites.empty:
 ## 6. Generate the aligned, consensus sequence for each sample
 ## Also output some other metrics about each covered site
 # ==========================================================
-
+if sites.empty:
+    print("WARNING: no valid amino acids found!\n\n")
 
 if not sites.empty:
 
@@ -948,7 +992,7 @@ if not sites.empty:
     
     VarSites.to_csv(os.path.join(output_dir, "VarSites.csv"), index=False)
 
-
+    print("Generating VarSites.csv\n")
 
 
 
@@ -1028,14 +1072,16 @@ if not consensus.empty:
     ##### Reference Fasta set, only proteins/genes that were found in one of the samples
     ref_fasta = FASTA[FASTA["Gene"].isin(consensus["Gene"].unique())].copy()
     ref_fasta["Consensus"] = ref_fasta["Sequence"]
-    ref_fasta["Sample"] = "000_Reference_Sequence" ### Unique tag to mark reference sequences (and not samples)
+    ref_fasta["Sample"] = ref_fasta["Annot"]
+    ref_fasta["REF_OR_NOT"] = "1" ### Unique tag to mark reference sequences (and not samples)
     
     ### Create reference annotation tag: Annot (or custom format)
     ref_fasta_subset = ref_fasta[["Consensus", "Annot", "Gene", "Sample"]].copy()
     
     ### Format a bit the samples consensus to merge them
-    consensus_to_bind = consensus[["Consensus", "Annot", "Gene", "Sample"]].copy()
+    consensus_to_bind = consensus[["Consensus", "Gene", "Sample"]].copy()
     consensus_to_bind["Sample"] = consensus_to_bind["Sample"].astype(str)
+    consensus_to_bind["REF_OR_NOT"] = "0"
     
     ### Merge Samples with Reference
     consensus_all = pd.concat([consensus_to_bind, ref_fasta_subset], ignore_index = True)
@@ -1046,7 +1092,7 @@ if not consensus.empty:
     def write_fasta(df, filepath):
         with open(filepath, "w") as f:
             for _, row in df.iterrows():
-                f.write(f">{row['Annot']}\n")
+                f.write(f">{row['Sample']}_{row['Gene']}\n")
                 #### Wrap sequence at 60 characters for standard FASTA formatting
                 seq = str(row["Consensus"])
                 for i in range(0, len(seq), 60):
@@ -1057,12 +1103,14 @@ if not consensus.empty:
     date_str = pd.Timestamp.today().strftime("%y%m%d")
     os.makedirs(output_dir, exist_ok = True)
 
-    ##### Consensus sequences for all samples aligned with reference sequences ("000")
+    ##### Consensus sequences for all samples aligned with reference sequences ("1")
     fasta_ref_path = os.path.join(output_dir, f"PR{date_str}_Consensus_Ref_MQ.fasta")
     write_fasta(consensus_all, fasta_ref_path)
 
     ##### Altarnative Consensus sequences of all samples only (excluding reference "000_Reference_Sequence")
-    consensus_samples_only = consensus_all[consensus_all["Sample"] != "000_Reference_Sequence"]
+    consensus_samples_only = consensus_all[consensus_all["REF_OR_NOT"] != "1"]
     fasta_samples_path = os.path.join(output_dir, f"PR{date_str}_Consensus_MQ.fasta")
     
     write_fasta(consensus_samples_only, fasta_samples_path)
+    
+    print("Generating consensus Fasta files\n")
