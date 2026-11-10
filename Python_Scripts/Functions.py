@@ -242,7 +242,7 @@ def all_contain(x, pattern="CON__", sep=";"):
             results.append(False)
             continue
         if sep not in str(item):
-            # Warning equivalent
+            ### Warning equivalent
             pass
         parts = str(item).split(sep)
         matches = [bool(re.search(pattern, p)) for p in parts]

@@ -15,16 +15,6 @@ from Bio import SeqIO
 # Script purpose: Environment setup, data loading, and FASTA processing
 # ==========================================================
 
-#### --- Environment Setup & Working Directory --- ####
-#### Safely get the directory where this script is located (handles command-line & interactive execution)
-try:
-    script_dir = Path(__file__).resolve().parent
-except NameError:
-    # Fallback for interactive environments like Jupyter notebooks
-    script_dir = Path.cwd()
-
-##### Set working directory to the script's location
-os.chdir(script_dir)
 
 ## Import custom functions from your functions module
 from Functions import (fasta_to_datatable, mq_intensity_64, most_common, all_contain, paste_list_cols, melt_mq_prot)
@@ -616,6 +606,8 @@ if recalculate_delta_scores and not plot_data.empty and Plotting_is_a_go:
     plt.close()
 
 
+
+
 ###==========================================================
 ### Apply PSM FDR Control
 
@@ -632,7 +624,7 @@ if recalculate_delta_scores and not Optimal_Delta_scores.empty:
     # Filter by threshold
     MSMS_F = MSMS_F[MSMS_F["Delta score"] >= MSMS_F["Optimal_Delta"]]
     MSMS_F = MSMS_F.drop(columns=["Optimal_Delta"])
-else:
+else: ## Otherwise just use MSMS as it was loaded
     MSMS_F = MSMS.copy()
 
 
@@ -670,27 +662,350 @@ MSMS_F = MSMS_F[MSMS_F["PassedFDR"] == True].copy()
 
 
 
+
+
+
+
 # ==========================================================
 ### 5. Transfer the filtered sequences from the MSMS table to the evidence table and
-### collapse to site level to combine information from overlapping peptides on 1 site
+### Collapse to site level to combine information from overlapping peptides on 1 site
 # ==========================================================
 
 
 
 
 
+### Filter the evidence table based on re-calculated delta scores and FDR passing evidence IDs
+evidenceF = evidence[evidence["id"].isin(MSMS_F["Evidence ID"])].copy()
+
+### Remove decoy/reverse hits and contaminant hits, filter them
+if decoy_col:
+    evidenceF = evidenceF[evidenceF[decoy_col] != "+"]
+
+
+### Remove matches to contaminants using our all_contain function
+if "Proteins" in evidenceF.columns:
+    contam_mask = all_contain(evidenceF["Proteins"], pattern="CON", sep=";")
+    evidenceF = evidenceF[~contam_mask.values] ### remove anything that had CON in the name of protein
+
+
+### Annotate evidence with peptide locations from PepSeqs
+## Drop Proteins column from MaxQuant
+if "Proteins" in evidenceF.columns:
+    evidenceF = evidenceF.drop(columns=["Proteins"])
+    
+## get the subset of annotation we want from PepSeqs, also drop duplicate Sequences (so we can merge them)
+pep_subset = PepSeqs[["Sequence", "Gene", "Proteins", "AlignedPos", "GaplessPositions"]].drop_duplicates(subset=["Sequence"])
+
+## Merge them with evidence using the "Sequence" column (peptide sequence)
+evidenceF = pd.merge(evidenceF, pep_subset, on = "Sequence", how = "left")
+
+### Filter based on exclusion list if it exists
+if os.path.exists(exclusion_path):
+    ### Load exclusion list
+    exclusion_list = pd.read_csv(exclusion_path)
+    
+    #### Ensure exclusion list has necessary columns or construct key
+    if "Sequence" in exclusion_list.columns and "Sample" in exclusion_list.columns:
+        
+        ### Then construct the exclusion list for each sample (merge sequence and sample name in one)
+        exclusion_list["Excl"] = exclusion_list["Sequence"].astype(str) + "_" + exclusion_list["Sample"].astype(str)
+        
+        ### Create new column in evidence that is the peptide sequence merged with the name (matches exclusion list)
+        evidenceF["Excl"] = evidenceF["Sequence"].astype(str) + "_" + evidenceF["Sample"].astype(str)
+        
+        ### Filter them
+        evidenceF = evidenceF[~evidenceF["Excl"].isin(exclusion_list["Excl"])]
+        evidenceF = evidenceF.drop(columns=["Excl"], errors = "ignore")
+
+
+#### Output evidence filtered csv into output folder
+os.makedirs(output_dir, exist_ok = True)
+evidenceF.to_csv(os.path.join(output_dir, "EvidenceFiltered.csv"), index = False)
+
+
+# ==========================================================
+# ID Counts Generation (Experiment & Sample level)
+# ==========================================================
+
+### IDs by Experiment
+IDbyExperiment = evidenceF.groupby(["Sample", "Fractionated", "Experiment"], observed=False).agg(
+    PSMs=("MS/MS count", "sum"),
+    ModPeps=("Modified sequence", "nunique"),
+    Peptides=("Sequence", "nunique")
+).reset_index()
+
+
+### IDs by Sample
+IDbySample = evidenceF.groupby("Sample", observed = False).agg(
+    PSMs=("MS/MS count", "sum"),
+    ModPeps=("Modified sequence", "nunique"),
+    Peptides=("Sequence", "nunique")
+).reset_index()
+
+
+#### Export ID summary tables
+IDbyExperiment.to_csv(os.path.join(output_dir, "IDbyExp.csv"), index = False)
+IDbySample.to_csv(os.path.join(output_dir, "IDbySample.csv"), index = False)
 
 
 
 
+
+### ==========================================================
+## Collapse Unique Modified Peptides (Charge State Collapse)
+### ==========================================================
+
+### Fill missing values with 0
+evidenceF["Intensity"] = evidenceF["Intensity"].fillna(0)
+### Remove rows where Gene is empty 
+evidenceF = evidenceF[evidenceF["Gene"].notna() & (evidenceF["Gene"].astype(str).str.strip() != "")]
+
+#### List of columns to be used to group together peptide hits
+group_cols = ["Sequence", "Proteins", "AlignedPos", "Modified sequence", "Gene", "Sample", "Fractionated", "Experiment"]
+
+#### Function to help compute log10 intensity safely
+def max_log_int(series):
+    vals = series.values
+    vals = vals[vals > 0] ## fitler values with intesity
+    if len(vals) == 0: ## if empty
+        return 0.0
+    return float(np.max(np.log10(vals)))
+
+### Create New columns for each unique peptide like PSM coutns supporting it, Charges Max In Score, Median intestiy score etc
+modpepsUnique = evidenceF[evidenceF["Gene"].notna()].groupby(group_cols, observed = True).agg(
+    PSMcount=("MS/MS count", "sum"), ## 
+    Charges=("Charge", lambda x: "/".join(map(str, sorted(x.unique())))),
+    MedScore=("Score", "median"), ##
+    MaxScore=("Score", "max"), ##
+    AvgMass=("m/z", "mean"), ##
+    AvgMassErrorPPM=("Mass error [ppm]", "mean"), ### Average error
+    MaxLogInt=("Intensity", max_log_int) ## Highest Log Intensity 
+).reset_index()
+
+#### clip off values lower than 0 for MaxLogInt
+modpepsUnique["MaxLogInt"] = modpepsUnique["MaxLogInt"].clip(lower = 0)
+modpepsUnique["id"] = range(1, len(modpepsUnique) + 1)
+
+
+
+
+
+### ==========================================================
+# Expand to Site Level & Calculate Coverage
+### ==========================================================
+### Now that every peptide has some useful metrics for us, we can expand the peptide list to sita-level list, keeping the metrics
+
+## List to be converted to Panda Frame
+## every AA position from a peptide will be added here
+site_records = []
+
+### Go through Peptides, that have an Aligned position
+for _, row in modpepsUnique[modpepsUnique["AlignedPos"].notna()].iterrows():
+    
+    ### Aminoacids of the Peptide
+    seq_chars = list(str(row["Sequence"]))
+    
+    ### Safely parse AlignedPos string (comma-separated integers)
+    try:
+        pos_list = [int(p.strip()) for p in str(row["AlignedPos"]).split(",") if p.strip() != ""]
+    except Exception:
+        continue
+    ### Loop through AA and their corresponding position on the alignment
+    for aa, pos in zip(seq_chars, pos_list):
+        #### Get annotation from pepetide, add it for every position
+        site_records.append({
+            "Proteins": row["Proteins"],
+            "Gene": row["Gene"],
+            "MedScore": row["MedScore"],
+            "MaxScore": row["MaxScore"],
+            "AvgMassErrorPPM": row["AvgMassErrorPPM"],
+            "MaxLogInt": row["MaxLogInt"],
+            "PSMcount": row["PSMcount"],
+            "id": row["id"],
+            "Sequence": row["Sequence"],
+            "Modified sequence": row["Modified sequence"],
+            "Sample": row["Sample"],
+            "Fractionated": row["Fractionated"],
+            "Experiment": row["Experiment"],
+            "AA": aa,
+            "Site": pos
+        })
+
+
+
+
+### convert to Dataframe
+sites = pd.DataFrame(site_records)
+
+
+
+### If things have worked so far....
+if not sites.empty:
+    
+    ### New column, name of gene and position on the alignment merged
+    sites["GeneSite"] = sites["Gene"].astype(str) + "_" + sites["Site"].astype(str)
+
+
+    #### PER EXPERIEMNT
+    ### Calculate sequence coverage per raw file / experiment 
+    AACoverageRawFile = sites.groupby("Experiment", observed = True)["GeneSite"].nunique().reset_index(name="AbsCoverage")
+    
+    gene_exp_counts = sites.groupby(["Experiment", "Gene"], observed=True)["GeneSite"].nunique().reset_index(name="GeneCount")
+    gene_exp_wide = gene_exp_counts.pivot(index="Experiment", columns="Gene", values="GeneCount").fillna(0).astype(int)
+    gene_exp_wide.columns = [str(col) for col in gene_exp_wide.columns]  # Optional: prefix gene columns
+    gene_exp_wide = gene_exp_wide.reset_index()
+    
+    AACoverageRawFile = pd.merge(AACoverageRawFile, gene_exp_wide, on="Experiment", how="left").fillna(0)
+    AACoverageRawFile.to_csv(os.path.join(output_dir, "AA_Coverage_by_Experiment.csv"), index = False)
+
+
+
+
+
+    ### PER SAMPLE
+    #### Collapse sites to have unique unmodified amino acids, merge together info about AA from overlapping peptides
+    sites_collapsed = sites.groupby(["Gene", "Site", "GeneSite", "AA", "Sample"], observed = False).agg(
+        MedScore=("MedScore", "median"),
+        MaxScore=("MaxScore", "max"),
+        AvgMassErrorPPM=("AvgMassErrorPPM", "mean"),
+        MaxLogInt=("MaxLogInt", "max"),
+        PSMcount=("PSMcount", "sum"),
+        Sequences=("Sequence", lambda x: ";".join(sorted(x.unique())))
+    ).reset_index()
+
+    ### Absolute sequence coverage per sample
+    AACoverageSample = sites_collapsed.groupby("Sample", observed=False)["GeneSite"].nunique().reset_index(name="AbsCoverage")
+    
+    #### Count Unique GeneSites (each overlapping a site is counted once). The results are also grouped by Gene
+    gene_sample_counts = sites_collapsed.groupby(["Sample", "Gene"], observed=True)["GeneSite"].nunique().reset_index(name = "GeneCount")
+    #### Make it into a proper table, where Columns are Genes, Rows are samples and values are AA counts
+    gene_sample_wide = gene_sample_counts.pivot(index = "Sample", columns = "Gene", values = "GeneCount").fillna(0).astype(int)
+    ### If we want to edit Column name, do it here (e.g. Protein-AMBN isntead of just AMBN)
+    gene_sample_wide.columns = [str(col) for col in gene_sample_wide.columns]
+    gene_sample_wide = gene_sample_wide.reset_index()
+    
+    #### Merge absolute coverage with per protein coverage and output
+    AACoverageSample = pd.merge(AACoverageSample, gene_sample_wide, on = "Sample", how = "left").fillna(0)
+    AACoverageSample.to_csv(os.path.join(output_dir, "AA_Coverage_by_Sample.csv"), index = False)
+   
+    
+    
 
 
 
 # ==========================================================
-## 6. Generate the consensus sequence
+## 6. Generate the aligned, consensus sequence for each sample
+## Also output some other metrics about each covered site
 # ==========================================================
 
 
+if not sites.empty:
+
+######################################################################
+#################### Variant Sites ####################
+
+    ### Calculate variant coverage (in PSM) and intensity
+    ### Add them as new columns to sites
+    sites["SiteCoverage"] = sites.groupby(["GeneSite", "Sample"], observed = True)["PSMcount"].transform("sum")
+    sites["SiteInt"] = sites.groupby(["GeneSite", "Sample"], observed=True)["MaxLogInt"].transform("sum")
+
+    ### Output full sites table
+    os.makedirs(output_dir, exist_ok = True)
+    sites.to_csv(os.path.join(output_dir, "Sites_table.csv"), index = False)
+
+    ### Relative coverage: Each PSM count / number of coverage for that position = How much of this peptide is contributing to the overal coverage
+    ## Note: 4 peptides can overlap over 1 AA site. Each one of those 4 peptides can have it's own number of PSMs
+    sites["RelCoverage"] = sites["PSMcount"] / sites["SiteCoverage"]
+    
+    ### Relative intensity: = How much of this peptide is contributing to the overal intensity
+    sites["RelInt"] = sites["MaxLogInt"] / sites["SiteInt"]
+    
+    ### The best contribution for each site
+    sites["MaxCoverage"] = sites.groupby(["GeneSite", "Sample"], observed = True)["RelCoverage"].transform("max")
+    
+    
+    
+############################################################    
+    ##########  Multi Variants Qualitifers ##############
+    
+    
+    #### Firts Filter Sites to be considered (how strict we should be):
+    valid_mask = ((sites["RelCoverage"] > 0.1) & (sites["RelInt"] > 0.1) & (sites["PSMcount"] >= 1))
+    valid_sites = sites[valid_mask]
+    
+    ##### Add new column "Multiplicity" for each Sample-GeneSite, counting the number of unique AAcids. 
+    multiplicity_df = (valid_sites.groupby(["GeneSite", "Sample"], observed=True)["AA"].nunique().reset_index(name = "Multiplicity"))
+    
+    ### Merge back onto the sites table using the grouping keys of Genesite and Sample
+    sites = sites.merge(multiplicity_df, on = ["GeneSite", "Sample"], how="left")
+
+
+    ### Extract variant sites table
+    var_mask = sites["Multiplicity"] > 1
+    VarSites = sites[var_mask][["Sample", "GeneSite", "RelCoverage", "RelInt", "PSMcount", "SiteCoverage", "AA"]].copy()
+    VarSites = VarSites.sort_values(by = ["Sample", "GeneSite", "RelCoverage", "RelInt", "PSMcount", "SiteCoverage", "AA"], ascending = [True, True, True, True, True, True, True]).reset_index(drop = True)
+    
+    VarSites.to_csv(os.path.join(output_dir, "VarSites.csv"), index=False)
+
+
+
+
+
+########### ================== ####################
+########### Consensus Sequence #################
+   ######## ~~~~~~~~~~~~~~~~~~ ##########
+    
+    ### Generate consensus table
+    ### Only keep sites where the relative coverate is the max coverage (the most common variant)
+    consensus = sites[sites["RelCoverage"] == sites["MaxCoverage"]].copy()
+    
+    ### Handle ties by maximum intensity
+    consensus["MaxSiteInt"] = consensus.groupby(["Sample", "GeneSite"], observed=True)["MaxLogInt"].transform("max")
+    consensus = consensus[consensus["MaxLogInt"] == consensus["MaxSiteInt"]].copy()
+    
+    ### Drop duplicates if any ties remain
+    consensus = consensus.drop_duplicates(subset=["Sample", "GeneSite"])
+
+    #### Create reference scaffold for all covered positions per sample
+    valid_genes = sites["Gene"].unique() ## list of genes
+    fasta_subset = FASTA[FASTA["Gene"].isin(valid_genes)].copy() ### FASTA but only these genes
+    
+    ### Get first sequence per gene
+    gene_seqs = fasta_subset.groupby("Gene")["Sequence"].first().reset_index()
+    
+    ### to be filled
+    all_pos_records = []
+    unique_samples = sites["Sample"].unique()
+    
+    ### Go through each fist sequence
+    for _, g_row in gene_seqs.iterrows():
+        gene = g_row["Gene"] ## Gene name
+        seq_len = len(str(g_row["Sequence"])) ### length of this sequence
+        for site in range(1, seq_len + 1): ### For each amino acid
+            for sample in unique_samples: ### For each of our samples
+                all_pos_records.append({"Gene": gene, "Site": site, "Sample": sample}) ### add an empty position as a dictionary
+                
+    AllPos = pd.DataFrame(all_pos_records) ### Convert to Data frame ### Contains every possible position per sample, per gene, to be filled in
+
+
+    #### Merge identified consensus sites with all possible alignment positions
+    consensus = pd.merge(AllPos, consensus, on = ["Sample", "Gene", "Site"], how = "left")
+
+    ### Fill gaps (missing sites) with dashes '-'
+    consensus["AA"] = consensus["AA"].fillna("-")
+
+    ### Sort for sequence assembly
+    consensus = consensus.sort_values(by=["Sample", "Gene", "Site"]).reset_index(drop = True)
+    
+    ### New table for Consensus Sequence
+    ### Paste together sites into a consensus sequence string per sample and gene
+    consensus_grouped = consensus.groupby(["Sample", "Gene"], observed = True).agg(Consensus = ("AA", lambda x: "".join(x))).reset_index()
+    
+
+    ### Merge with ExpAnnot to keep valid sample mappings
+    exp_samples = ExpAnnot[["Sample"]].drop_duplicates()
+    consensus = pd.merge(consensus_grouped, exp_samples, on = "Sample", how = "inner")
 
 
 
@@ -700,8 +1015,54 @@ MSMS_F = MSMS_F[MSMS_F["PassedFDR"] == True].copy()
 
 
 
+##### POR FIN ########
+### ==========================================================
+#### 7. Generate output Files
+### ==========================================================
 
 
-# ==========================================================
-## 7. Generate output Files
-# ==========================================================
+
+
+if not consensus.empty:
+    
+    ##### Reference Fasta set, only proteins/genes that were found in one of the samples
+    ref_fasta = FASTA[FASTA["Gene"].isin(consensus["Gene"].unique())].copy()
+    ref_fasta["Consensus"] = ref_fasta["Sequence"]
+    ref_fasta["Sample"] = "000_Reference_Sequence" ### Unique tag to mark reference sequences (and not samples)
+    
+    ### Create reference annotation tag: Annot (or custom format)
+    ref_fasta_subset = ref_fasta[["Consensus", "Annot", "Gene", "Sample"]].copy()
+    
+    ### Format a bit the samples consensus to merge them
+    consensus_to_bind = consensus[["Consensus", "Annot", "Gene", "Sample"]].copy()
+    consensus_to_bind["Sample"] = consensus_to_bind["Sample"].astype(str)
+    
+    ### Merge Samples with Reference
+    consensus_all = pd.concat([consensus_to_bind, ref_fasta_subset], ignore_index = True)
+    consensus_all = consensus_all.sort_values(by = ["Gene", "Sample"]).reset_index(drop = True)
+
+
+    ### Helper function to write FASTA files in Python
+    def write_fasta(df, filepath):
+        with open(filepath, "w") as f:
+            for _, row in df.iterrows():
+                f.write(f">{row['Annot']}\n")
+                #### Wrap sequence at 60 characters for standard FASTA formatting
+                seq = str(row["Consensus"])
+                for i in range(0, len(seq), 60):
+                    f.write(seq[i:i+60] + "\n")
+    
+    
+    ##### Get date and time, to be used for output_name
+    date_str = pd.Timestamp.today().strftime("%y%m%d")
+    os.makedirs(output_dir, exist_ok = True)
+
+    ##### Consensus sequences for all samples aligned with reference sequences ("000")
+    fasta_ref_path = os.path.join(output_dir, f"PR{date_str}_Consensus_Ref_MQ.fasta")
+    write_fasta(consensus_all, fasta_ref_path)
+
+    ##### Altarnative Consensus sequences of all samples only (excluding reference "000_Reference_Sequence")
+    consensus_samples_only = consensus_all[consensus_all["Sample"] != "000_Reference_Sequence"]
+    fasta_samples_path = os.path.join(output_dir, f"PR{date_str}_Consensus_MQ.fasta")
+    
+    write_fasta(consensus_samples_only, fasta_samples_path)
